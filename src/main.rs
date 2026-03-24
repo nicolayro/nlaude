@@ -47,6 +47,7 @@ impl Message {
     }
 }
 
+#[derive(Debug)]
 enum Response {
     Text(String),
     ToolCall {
@@ -128,11 +129,11 @@ async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Er
 
     let mut req = reqwest::Client::new()
         .post(&url)
-        .header("content-type", "application/json")
-        .body(body_str.clone());
+        .header("content-type", "application/json");
 
     // Signer requesten med AWS Signature V4
     req = sign_request(req, &credentials, &url, &body_str)?;
+    let req = req.body(body_str);
 
     let response = req.send().await?.error_for_status()?.text().await?;
     parse_response(&response)
@@ -169,15 +170,12 @@ fn sign_request(
     Ok(req)
 }
 
-// Agentic loop: kall prompt i loop til modellen svarer med tekst
 const MAX_ITERATIONS: usize = 10;
 
 // Agentic loop: kall prompt i loop til modellen svarer med tekst
-async fn run_agent(messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
-    let mut context = messages.to_vec();
-
+async fn run_agent(context: &mut Vec<Message>) -> Result<String, Box<dyn std::error::Error>> {
     for _ in 0..MAX_ITERATIONS {
-        match prompt(&context).await? {
+        match prompt(context).await? {
             Response::Text(text) => return Ok(text),
             Response::ToolCall { name, id, input: args, raw_block } => {
                 match name.as_str() {
@@ -220,7 +218,7 @@ async fn main() {
 
         context.push(Message::user(user_message));
 
-        match run_agent(&context).await {
+        match run_agent(&mut context).await {
             Ok(text) => {
                 println!("\n{PURPLE}{BOLD}nlaude:{RESET}\n{text}\n");
                 context.push(Message::assistant(&text));
@@ -271,8 +269,8 @@ mod tests {
     async fn agent_uses_tool_and_returns_text() {
         dotenvy::dotenv().ok();
         // Be om innholdet i en fil - modellen må bruke read_file for å svare
-        let messages = [Message::user("Hva er navnet på pakken i Cargo.toml?")];
-        let response = run_agent(&messages).await.unwrap();
+        let mut messages = vec![Message::user("Hva er navnet på pakken i Cargo.toml?")];
+        let response = run_agent(&mut messages).await.unwrap();
         assert!(response.contains("nlaude"));
     }
 
