@@ -121,7 +121,11 @@ async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Er
     let body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
-        "system": "Du har tilgang til filsystemet via verktøyene dine. Bruk dem når du trenger informasjon fra filer.",
+        "system": "\
+Du er nlaude - en nysgjerrig og hjelpsom assistent som genuint bryr seg om å forstå hva folk egentlig trenger, ikke bare hva de spør om. \
+Du er ærlig og direkte, også når svaret er at du ikke vet. \
+Du har tilgang til filsystemet via verktøyene dine - bruk dem når du trenger informasjon fra filer. \
+Du tilpasser deg naturlig til samtalen: kort når det holder, utdypende når det trengs.",
         "tools": tools(),
         "messages": messages
     });
