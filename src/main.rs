@@ -8,29 +8,102 @@ const REGION: &str = "eu-north-1";
 #[derive(Serialize, Deserialize, Clone)]
 struct Message {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 impl Message {
     fn user(text: &str) -> Self {
-        Self { role: "user".to_string(), content: text.to_string() }
+        Self { role: "user".to_string(), content: serde_json::json!(text) }
     }
 
     fn assistant(text: &str) -> Self {
-        Self { role: "assistant".to_string(), content: text.to_string() }
+        Self { role: "assistant".to_string(), content: serde_json::json!(text) }
+    }
+
+    fn assistant_tool_use(block: serde_json::Value) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: serde_json::json!([block]),
+        }
+    }
+
+    fn tool_result(tool_use_id: &str, result: &str) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": result
+            }]),
+        }
     }
 }
 
-fn parse_response(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let v: serde_json::Value = serde_json::from_str(raw)?;
-    let text = v["content"][0]["text"]
-        .as_str()
-        .ok_or("uventet responsstruktur fra Bedrock")?
-        .to_string();
-    Ok(text)
+enum ToolName {
+    ReadFile,
 }
 
-async fn prompt(messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
+impl TryFrom<&str> for ToolName {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "read_file" => Ok(ToolName::ReadFile),
+            other => Err(format!("ukjent verktøy: {other}")),
+        }
+    }
+}
+
+enum Response {
+    Text(String),
+    ToolCall { name: ToolName, id: String, input: serde_json::Value, raw_block: serde_json::Value },
+}
+
+fn parse_response(raw: &str) -> Result<Response, Box<dyn std::error::Error>> {
+    let v: serde_json::Value = serde_json::from_str(raw)?;
+    let block = &v["content"][0];
+
+    match block["type"].as_str() {
+        Some("text") => {
+            let text = block["text"]
+                .as_str()
+                .ok_or("mangler text-felt")?
+                .to_string();
+            Ok(Response::Text(text))
+        }
+        Some("tool_use") => {
+            let name = block["name"]
+                .as_str()
+                .ok_or("mangler name-felt")?;
+            let id = block["id"]
+                .as_str()
+                .ok_or("mangler id-felt")?
+                .to_string();
+            Ok(Response::ToolCall {
+                name: ToolName::try_from(name)?,
+                id,
+                input: block["input"].clone(),
+                raw_block: block.clone(),
+            })
+        }
+        _ => Err("uventet responsstruktur fra Bedrock".into()),
+    }
+}
+
+// Tool calls er bare JSON-skjemaer vi sender med i requesten
+const TOOLS: &str = r#"[{
+    "name": "read_file",
+    "description": "Les innholdet i en fil",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "Filsti" }
+        },
+        "required": ["path"]
+    }
+}]"#;
+
+async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Error>> {
     let model = std::env::var("BEDROCK_MODEL")?;
     let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
 
@@ -49,10 +122,12 @@ async fn prompt(messages: &[Message]) -> Result<String, Box<dyn std::error::Erro
         urlencoding::encode(&model)
     );
 
-    // Bygg request-body med hele samtalehistorikken
+    // Bygg request-body med hele samtalehistorikken og tilgjengelige verktøy
+    let tools: serde_json::Value = serde_json::from_str(TOOLS)?;
     let body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
+        "tools": tools,
         "messages": messages
     });
     let body_str = serde_json::to_string(&body)?;
@@ -109,9 +184,18 @@ async fn main() {
         context.push(Message::user(user_message));
 
         match prompt(&context).await {
-            Ok(response) => {
-                println!("nlaude: {response}");
-                context.push(Message::assistant(&response));
+            Ok(Response::Text(text)) => {
+                println!("nlaude: {text}");
+                context.push(Message::assistant(&text));
+            }
+            Ok(Response::ToolCall { name: ToolName::ReadFile, id, input: args, raw_block }) => {
+                let path = args["path"].as_str().unwrap_or("");
+                println!("[verktøy] read_file({path})");
+                let result = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| format!("feil: {e}"));
+                // APIet krever at assistant-meldingen med tool_use ligger før tool_result
+                context.push(Message::assistant_tool_use(raw_block));
+                context.push(Message::tool_result(&id, &result));
             }
             Err(e) => eprintln!("feil: {e}"),
         }
@@ -126,12 +210,25 @@ mod tests {
     fn parse_response_extracts_text() {
         let raw = r#"{"content": [{"type": "text", "text": "4"}]}"#;
         let result = parse_response(raw).unwrap();
-        assert_eq!(result, "4");
+        assert!(matches!(result, Response::Text(t) if t == "4"));
+    }
+
+    #[test]
+    fn parse_response_extracts_tool_call() {
+        let raw = r#"{"content": [{"type": "tool_use", "id": "abc", "name": "read_file", "input": {"path": "foo.txt"}}]}"#;
+        let result = parse_response(raw).unwrap();
+        assert!(matches!(result, Response::ToolCall { name: ToolName::ReadFile, .. }));
     }
 
     #[test]
     fn parse_response_feiler_ved_ugyldig_struktur() {
         let raw = r#"{"message": "feil"}"#;
+        assert!(parse_response(raw).is_err());
+    }
+
+    #[test]
+    fn parse_response_feiler_ved_ukjent_tool() {
+        let raw = r#"{"content": [{"type": "tool_use", "id": "abc", "name": "ukjent_tool", "input": {}}]}"#;
         assert!(parse_response(raw).is_err());
     }
 
@@ -141,7 +238,7 @@ mod tests {
         dotenvy::dotenv().ok();
         let messages = [Message::user("Hva er 2 + 2? Svar kun med tallet.")];
         let response = prompt(&messages).await.unwrap();
-        assert!(!response.is_empty());
+        assert!(matches!(response, Response::Text(_)));
     }
 
     #[tokio::test]
@@ -154,6 +251,6 @@ mod tests {
             Message::user("Hva er favorittallet mitt? Svar kun med tallet."),
         ];
         let response = prompt(&messages).await.unwrap();
-        assert!(response.contains("42"));
+        assert!(matches!(response, Response::Text(t) if t.contains("42")));
     }
 }
