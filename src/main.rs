@@ -6,6 +6,13 @@ use std::io::Write;
 
 const REGION: &str = "eu-north-1";
 
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const GREY: &str = "\x1b[90m";
+const PURPLE: &str = "\x1b[95m";
+const CYAN: &str = "\x1b[96m";
+const RED: &str = "\x1b[91m";
+
 #[derive(Serialize, Deserialize, Clone)]
 struct Message {
     role: String,
@@ -176,7 +183,7 @@ async fn run_agent(messages: &[Message]) -> Result<String, Box<dyn std::error::E
                 match name.as_str() {
                     "read_file" => {
                         let path = args["path"].as_str().unwrap_or("");
-                        println!("[verktøy] read_file({path})");
+                        println!("{CYAN}{BOLD}[verktøy]{RESET}{CYAN} read_file({path}){RESET}");
                         let result = std::fs::read_to_string(path)
                             .unwrap_or_else(|e| format!("feil: {e}"));
                         context.push(Message::assistant_tool_use(raw_block));
@@ -195,12 +202,15 @@ async fn run_agent(messages: &[Message]) -> Result<String, Box<dyn std::error::E
 async fn main() {
     dotenvy::dotenv().ok();
 
+    println!("{PURPLE}{BOLD}nlaude{RESET}");
+    println!("{GREY}Skriv 'exit' for å avslutte.{RESET}\n");
+
     let mut context: Vec<Message> = Vec::new();
     let mut input = String::new();
 
     loop {
         input.clear();
-        print!("du: ");
+        print!("{GREY}du:{RESET} ");
         std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut input).unwrap();
 
@@ -212,12 +222,12 @@ async fn main() {
 
         match run_agent(&context).await {
             Ok(text) => {
-                println!("nlaude: {text}");
+                println!("\n{PURPLE}{BOLD}nlaude:{RESET}\n{text}\n");
                 context.push(Message::assistant(&text));
             }
             Err(e) => {
                 context.pop();
-                eprintln!("feil: {e}");
+                eprintln!("{RED}feil:{RESET} {e}");
             }
         }
     }
