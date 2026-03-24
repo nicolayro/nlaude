@@ -15,6 +15,10 @@ impl Message {
     fn user(text: &str) -> Self {
         Self { role: "user".to_string(), content: text.to_string() }
     }
+
+    fn assistant(text: &str) -> Self {
+        Self { role: "assistant".to_string(), content: text.to_string() }
+    }
 }
 
 fn parse_response(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -26,7 +30,6 @@ fn parse_response(raw: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(text)
 }
 
-#[allow(dead_code)]
 async fn prompt(messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
     let model = std::env::var("BEDROCK_MODEL")?;
     let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
@@ -46,6 +49,7 @@ async fn prompt(messages: &[Message]) -> Result<String, Box<dyn std::error::Erro
         urlencoding::encode(&model)
     );
 
+    // Bygg request-body med hele samtalehistorikken
     let body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
@@ -85,8 +89,33 @@ async fn prompt(messages: &[Message]) -> Result<String, Box<dyn std::error::Erro
     parse_response(&response)
 }
 
-fn main() {
-    println!("nlaude");
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
+
+    let mut context: Vec<Message> = Vec::new();
+    let mut input = String::new();
+
+    loop {
+        input.clear();
+        print!("du: ");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::io::stdin().read_line(&mut input).unwrap();
+
+        let user_message = input.trim();
+        if user_message.is_empty() { continue; }
+        if user_message == "exit" { break; }
+
+        context.push(Message::user(user_message));
+
+        match prompt(&context).await {
+            Ok(response) => {
+                println!("nlaude: {response}");
+                context.push(Message::assistant(&response));
+            }
+            Err(e) => eprintln!("feil: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -113,5 +142,18 @@ mod tests {
         let messages = [Message::user("Hva er 2 + 2? Svar kun med tallet.")];
         let response = prompt(&messages).await.unwrap();
         assert!(!response.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn context_remembers_previous_messages() {
+        dotenvy::dotenv().ok();
+        let messages = [
+            Message::user("Mitt favorittall er 42. Husk det."),
+            Message::assistant("Jeg har notert det! Favorittallet ditt er 42."),
+            Message::user("Hva er favorittallet mitt? Svar kun med tallet."),
+        ];
+        let response = prompt(&messages).await.unwrap();
+        assert!(response.contains("42"));
     }
 }
