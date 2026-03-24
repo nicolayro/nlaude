@@ -2,6 +2,7 @@ use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 const REGION: &str = "eu-north-1";
 
@@ -29,7 +30,7 @@ impl Message {
 
     fn tool_result(tool_use_id: &str, result: &str) -> Self {
         Self {
-            role: "user".to_string(),
+            role: "user".to_string(), // APIets konvensjon: tool_result sendes som user-melding
             content: serde_json::json!([{
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -39,69 +40,55 @@ impl Message {
     }
 }
 
-enum ToolName {
-    ReadFile,
-}
-
-impl TryFrom<&str> for ToolName {
-    type Error = String;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "read_file" => Ok(ToolName::ReadFile),
-            other => Err(format!("ukjent verktøy: {other}")),
-        }
-    }
-}
-
 enum Response {
     Text(String),
-    ToolCall { name: ToolName, id: String, input: serde_json::Value, raw_block: serde_json::Value },
+    ToolCall {
+        name: String,
+        id: String,
+        input: serde_json::Value,
+        raw_block: serde_json::Value, // originalen sendes tilbake til API-et uforandret
+    },
 }
 
 fn parse_response(raw: &str) -> Result<Response, Box<dyn std::error::Error>> {
     let v: serde_json::Value = serde_json::from_str(raw)?;
-    let block = &v["content"][0];
+    let content = v["content"].as_array().ok_or("mangler content-array")?;
 
-    match block["type"].as_str() {
-        Some("text") => {
-            let text = block["text"]
-                .as_str()
-                .ok_or("mangler text-felt")?
-                .to_string();
-            Ok(Response::Text(text))
-        }
-        Some("tool_use") => {
-            let name = block["name"]
-                .as_str()
-                .ok_or("mangler name-felt")?;
-            let id = block["id"]
-                .as_str()
-                .ok_or("mangler id-felt")?
-                .to_string();
-            Ok(Response::ToolCall {
-                name: ToolName::try_from(name)?,
-                id,
-                input: block["input"].clone(),
-                raw_block: block.clone(),
-            })
-        }
-        _ => Err("uventet responsstruktur fra Bedrock".into()),
+    // Tool use har prioritet - finn første tool_use-blokk hvis den finnes
+    if let Some(block) = content.iter().find(|b| b["type"] == "tool_use") {
+        let name = block["name"].as_str().ok_or("mangler name-felt")?.to_string();
+        let id = block["id"].as_str().ok_or("mangler id-felt")?.to_string();
+        return Ok(Response::ToolCall {
+            name,
+            id,
+            input: block["input"].clone(),
+            raw_block: block.clone(),
+        });
     }
+
+    // Ellers forvent tekst
+    if let Some(block) = content.iter().find(|b| b["type"] == "text") {
+        let text = block["text"].as_str().ok_or("mangler text-felt")?.to_string();
+        return Ok(Response::Text(text));
+    }
+
+    Err("uventet responsstruktur fra Bedrock".into())
 }
 
-// Tool calls er bare JSON-skjemaer vi sender med i requesten
-const TOOLS: &str = r#"[{
-    "name": "read_file",
-    "description": "Les innholdet i en fil",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "path": { "type": "string", "description": "Filsti" }
-        },
-        "required": ["path"]
-    }
-}]"#;
+// Verktøydefinisjon - sendes med i hver request slik at modellen vet hva den kan bruke
+fn tools() -> serde_json::Value {
+    serde_json::json!([{
+        "name": "read_file",
+        "description": "Les innholdet i en fil",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Filsti" }
+            },
+            "required": ["path"]
+        }
+    }])
+}
 
 async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Error>> {
     let model = std::env::var("BEDROCK_MODEL")?;
@@ -123,17 +110,34 @@ async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Er
     );
 
     // Bygg request-body med hele samtalehistorikken og tilgjengelige verktøy
-    let tools: serde_json::Value = serde_json::from_str(TOOLS)?;
     let body = serde_json::json!({
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 1024,
-        "tools": tools,
+        "system": "Du har tilgang til filsystemet via verktøyene dine. Bruk dem når du trenger informasjon fra filer.",
+        "tools": tools(),
         "messages": messages
     });
     let body_str = serde_json::to_string(&body)?;
 
+    let mut req = reqwest::Client::new()
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(body_str.clone());
+
     // Signer requesten med AWS Signature V4
-    let identity = credentials.into();
+    req = sign_request(req, &credentials, &url, &body_str)?;
+
+    let response = req.send().await?.error_for_status()?.text().await?;
+    parse_response(&response)
+}
+
+fn sign_request(
+    mut req: reqwest::RequestBuilder,
+    credentials: &aws_credential_types::Credentials,
+    url: &str,
+    body: &str,
+) -> Result<reqwest::RequestBuilder, Box<dyn std::error::Error>> {
+    let identity = credentials.clone().into();
     let signing_params = v4::SigningParams::builder()
         .identity(&identity)
         .region(REGION)
@@ -144,24 +148,47 @@ async fn prompt(messages: &[Message]) -> Result<Response, Box<dyn std::error::Er
 
     let signable = SignableRequest::new(
         "POST",
-        &url,
+        url,
         std::iter::empty(),
-        SignableBody::Bytes(body_str.as_bytes()),
+        SignableBody::Bytes(body.as_bytes()),
     )?;
 
     let (instructions, _) = sign(signable, &signing_params.into())?.into_parts();
-
-    let mut req = reqwest::Client::new()
-        .post(&url)
-        .header("content-type", "application/json")
-        .body(body_str);
 
     for (name, value) in instructions.headers() {
         req = req.header(name, value);
     }
 
-    let response = req.send().await?.error_for_status()?.text().await?;
-    parse_response(&response)
+    Ok(req)
+}
+
+// Agentic loop: kall prompt i loop til modellen svarer med tekst
+const MAX_ITERATIONS: usize = 10;
+
+// Agentic loop: kall prompt i loop til modellen svarer med tekst
+async fn run_agent(messages: &[Message]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut context = messages.to_vec();
+
+    for _ in 0..MAX_ITERATIONS {
+        match prompt(&context).await? {
+            Response::Text(text) => return Ok(text),
+            Response::ToolCall { name, id, input: args, raw_block } => {
+                match name.as_str() {
+                    "read_file" => {
+                        let path = args["path"].as_str().unwrap_or("");
+                        println!("[verktøy] read_file({path})");
+                        let result = std::fs::read_to_string(path)
+                            .unwrap_or_else(|e| format!("feil: {e}"));
+                        context.push(Message::assistant_tool_use(raw_block));
+                        context.push(Message::tool_result(&id, &result));
+                    }
+                    other => return Err(format!("ukjent verktøy: {other}").into()),
+                }
+            }
+        }
+    }
+
+    Err(format!("agent nådde maks iterasjoner ({MAX_ITERATIONS})").into())
 }
 
 #[tokio::main]
@@ -174,7 +201,7 @@ async fn main() {
     loop {
         input.clear();
         print!("du: ");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut input).unwrap();
 
         let user_message = input.trim();
@@ -183,21 +210,15 @@ async fn main() {
 
         context.push(Message::user(user_message));
 
-        match prompt(&context).await {
-            Ok(Response::Text(text)) => {
+        match run_agent(&context).await {
+            Ok(text) => {
                 println!("nlaude: {text}");
                 context.push(Message::assistant(&text));
             }
-            Ok(Response::ToolCall { name: ToolName::ReadFile, id, input: args, raw_block }) => {
-                let path = args["path"].as_str().unwrap_or("");
-                println!("[verktøy] read_file({path})");
-                let result = std::fs::read_to_string(path)
-                    .unwrap_or_else(|e| format!("feil: {e}"));
-                // APIet krever at assistant-meldingen med tool_use ligger før tool_result
-                context.push(Message::assistant_tool_use(raw_block));
-                context.push(Message::tool_result(&id, &result));
+            Err(e) => {
+                context.pop();
+                eprintln!("feil: {e}");
             }
-            Err(e) => eprintln!("feil: {e}"),
         }
     }
 }
@@ -217,18 +238,12 @@ mod tests {
     fn parse_response_extracts_tool_call() {
         let raw = r#"{"content": [{"type": "tool_use", "id": "abc", "name": "read_file", "input": {"path": "foo.txt"}}]}"#;
         let result = parse_response(raw).unwrap();
-        assert!(matches!(result, Response::ToolCall { name: ToolName::ReadFile, .. }));
+        assert!(matches!(result, Response::ToolCall { name, .. } if name == "read_file"));
     }
 
     #[test]
     fn parse_response_feiler_ved_ugyldig_struktur() {
         let raw = r#"{"message": "feil"}"#;
-        assert!(parse_response(raw).is_err());
-    }
-
-    #[test]
-    fn parse_response_feiler_ved_ukjent_tool() {
-        let raw = r#"{"content": [{"type": "tool_use", "id": "abc", "name": "ukjent_tool", "input": {}}]}"#;
         assert!(parse_response(raw).is_err());
     }
 
@@ -239,6 +254,16 @@ mod tests {
         let messages = [Message::user("Hva er 2 + 2? Svar kun med tallet.")];
         let response = prompt(&messages).await.unwrap();
         assert!(matches!(response, Response::Text(_)));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn agent_uses_tool_and_returns_text() {
+        dotenvy::dotenv().ok();
+        // Be om innholdet i en fil - modellen må bruke read_file for å svare
+        let messages = [Message::user("Hva er navnet på pakken i Cargo.toml?")];
+        let response = run_agent(&messages).await.unwrap();
+        assert!(response.contains("nlaude"));
     }
 
     #[tokio::test]
